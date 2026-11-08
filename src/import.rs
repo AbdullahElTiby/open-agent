@@ -709,9 +709,10 @@ fn patch_changes(patch: &str) -> Value {
     let mut cur: Option<PatchFile> = None;
     let push = push_patch_file;
     for line in patch.lines() {
-        let header = HEADERS
-            .iter()
-            .find_map(|&(p, k)| line.strip_prefix(p).map(|rest| (rest.trim().to_string(), k)));
+        let header = HEADERS.iter().find_map(|&(p, k)| {
+            line.strip_prefix(p)
+                .map(|rest| (rest.trim().to_string(), k))
+        });
         if let Some((path, kind)) = header {
             push(&mut cur, &mut changes);
             cur = Some((path, kind, String::new(), String::new()));
