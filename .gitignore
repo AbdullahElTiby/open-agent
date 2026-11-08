@@ -1,0 +1,9 @@
+/target
+legacy/tauri-web/node_modules
+legacy/tauri-web/dist
+legacy/tauri-web/src-tauri/target
+legacy/tauri-web/src-tauri/gen
+*.log
+.claude/settings.local.json
+.env
+.env.*

@@ -1,0 +1,30 @@
+[package]
+name = "open-agent"
+version = "0.2.0"
+description = "Open Agent — a native Rust AI coding agent powered by Claude Code and Codex"
+edition = "2021"
+license = "MIT"
+readme = "README.md"
+keywords = ["ai", "agent", "claude", "codex", "egui"]
+
+[dependencies]
+eframe = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
+rfd = "0.18"
+image = { version = "0.25", default-features = false, features = ["png"] }
+ureq = "3"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+opt-level = 3
+
+# Keep debug builds snappy for UI work.
+[profile.dev.package."*"]
+opt-level = 2
+
+[build-dependencies]
+winresource = "0.1"
