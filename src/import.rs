@@ -17,7 +17,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Tool output is capped so `sessions.json` stays small enough to save quickly.
-const MAX_OUTPUT: usize = 6000;
+const MAX_OUTPUT: usize = 1000;
+/// File contents in tool inputs (Write, Edit) feed the Changes diff, so they get more room.
+const MAX_INPUT: usize = 6_000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Source {
@@ -42,6 +44,8 @@ pub struct Report {
     pub claude: usize,
     pub codex: usize,
     pub skipped: usize,
+    /// Headless `claude -p` / Agent SDK runs (scripts, title generators, other apps).
+    pub automated: usize,
     pub failed: usize,
 }
 
@@ -60,6 +64,10 @@ pub fn run(source: Source, known: &HashSet<String>) -> Report {
                 r.failed += 1;
                 continue;
             };
+            if is_automated(&raw) {
+                r.automated += 1;
+                continue;
+            }
             // Transcripts without a single prompt (aborted starts, summaries only) are ignored.
             if let Some(s) = parse_claude(&raw, &id) {
                 r.claude += 1;
@@ -307,9 +315,17 @@ impl Builder {
                 is_error,
             } => AgentEvent::ToolEnd {
                 id,
-                output: cap(output),
+                output: cap(output, MAX_OUTPUT),
                 is_error,
             },
+            AgentEvent::ToolStart {
+                id,
+                name,
+                mut input,
+            } => {
+                cap_strings(&mut input);
+                AgentEvent::ToolStart { id, name, input }
+            }
             e => e,
         };
         apply_event(m, &e);
@@ -382,9 +398,25 @@ impl Builder {
     }
 }
 
-fn cap(mut s: String) -> String {
-    if s.len() > MAX_OUTPUT {
-        let mut cut = MAX_OUTPUT;
+/// Claude records how a session was started; `sdk-*` means a program drove it, not a person.
+fn is_automated(raw: &str) -> bool {
+    const KEY: &str = "\"entrypoint\":\"";
+    raw.find(KEY)
+        .is_some_and(|i| raw[i + KEY.len()..].starts_with("sdk"))
+}
+
+fn cap_strings(v: &mut Value) {
+    match v {
+        Value::String(s) if s.len() > MAX_INPUT => *s = cap(std::mem::take(s), MAX_INPUT),
+        Value::Array(a) => a.iter_mut().for_each(cap_strings),
+        Value::Object(o) => o.values_mut().for_each(cap_strings),
+        _ => {}
+    }
+}
+
+fn cap(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut cut = max;
         while !s.is_char_boundary(cut) {
             cut -= 1;
         }
@@ -1042,5 +1074,40 @@ mod tests {
         );
         assert_eq!(a.meta.output_tokens, Some(40));
         assert_eq!(a.meta.model.as_deref(), Some("gpt-5.5-codex"));
+    }
+}
+
+#[cfg(test)]
+mod live {
+    /// `OA_IMPORT_LIVE=1 cargo test live -- --nocapture` scans this machine's real sessions.
+    #[test]
+    fn scan_this_machine() {
+        if std::env::var("OA_IMPORT_LIVE").is_err() {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let r = super::run(super::Source::All, &Default::default());
+        let bytes = serde_json::to_string(&r.sessions)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        println!(
+            "claude={} codex={} skipped={} automated={} failed={} json={}KB in {:?}",
+            r.claude,
+            r.codex,
+            r.skipped,
+            r.automated,
+            r.failed,
+            bytes / 1024,
+            t.elapsed()
+        );
+        for s in r.sessions.iter().take(12) {
+            println!(
+                "  [{:?}] {} msgs  {}  |  {}",
+                s.provider,
+                s.messages.len(),
+                s.cwd,
+                s.title
+            );
+        }
     }
 }

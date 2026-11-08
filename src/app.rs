@@ -394,6 +394,9 @@ impl App {
         if report.skipped > 0 {
             msg.push_str(&format!(" · {} already here", report.skipped));
         }
+        if report.automated > 0 {
+            msg.push_str(&format!(" · {} automated runs left out", report.automated));
+        }
         if report.failed > 0 {
             msg.push_str(&format!(" · {} unreadable", report.failed));
         }
