@@ -399,10 +399,16 @@ impl Builder {
 }
 
 /// Claude records how a session was started; `sdk-*` means a program drove it, not a person.
+/// Every record carries a top-level `entrypoint`, so the first one that has it decides.
 fn is_automated(raw: &str) -> bool {
-    const KEY: &str = "\"entrypoint\":\"";
-    raw.find(KEY)
-        .is_some_and(|i| raw[i + KEY.len()..].starts_with("sdk"))
+    raw.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
+        .find_map(|v| {
+            v.get("entrypoint")
+                .and_then(Value::as_str)
+                .map(|e| e.starts_with("sdk"))
+        })
+        .unwrap_or(false)
 }
 
 fn cap_strings(v: &mut Value) {
@@ -414,14 +420,14 @@ fn cap_strings(v: &mut Value) {
     }
 }
 
+/// Keeps at most `max` characters (not bytes), so non-ASCII text gets the full allowance.
 fn cap(mut s: String, max: usize) -> String {
-    if s.len() > max {
-        let mut cut = max;
-        while !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
+    if let Some((cut, _)) = s.char_indices().nth(max) {
         s.truncate(cut);
-        s.push_str("\n… [truncated on import]");
+        s.push_str(
+            "
+… [truncated on import]",
+        );
     }
     s
 }
@@ -1078,11 +1084,37 @@ mod tests {
 }
 
 #[cfg(test)]
+mod caps {
+    use super::*;
+
+    #[test]
+    fn automated_uses_top_level_entrypoint() {
+        assert!(is_automated(r#"{"type":"user", "entrypoint" : "sdk-cli"}"#));
+        assert!(!is_automated(r#"{"type":"user","entrypoint":"cli"}"#));
+        // A nested field (e.g. inside a tool result) must not count.
+        assert!(!is_automated(
+            r#"{"type":"user","entrypoint":"cli","message":{"entrypoint":"sdk-ts"}}"#
+        ));
+        assert!(!is_automated(r#"{"type":"summary"}"#));
+    }
+
+    #[test]
+    fn cap_counts_characters() {
+        let s = "é".repeat(10);
+        assert_eq!(cap(s.clone(), 10), s);
+        assert!(cap(s, 4).starts_with(
+            "éééé
+…"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod live {
     /// `OA_IMPORT_LIVE=1 cargo test live -- --nocapture` scans this machine's real sessions.
     #[test]
     fn scan_this_machine() {
-        if std::env::var("OA_IMPORT_LIVE").is_err() {
+        if std::env::var("OA_IMPORT_LIVE").as_deref() != Ok("1") {
             return;
         }
         let t = std::time::Instant::now();
@@ -1102,7 +1134,7 @@ mod live {
         );
         for s in r.sessions.iter().take(12) {
             println!(
-                "  [{:?}] {} msgs  {}  |  {}",
+                "  [{:?}] {} msgs  {:?}  |  {:?}",
                 s.provider,
                 s.messages.len(),
                 s.cwd,
