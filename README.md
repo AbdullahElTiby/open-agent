@@ -17,6 +17,12 @@ cargo run --release
 
 The binary is `target/release/open-agent.exe` (~14 MB, no installer needed). Sessions are saved to `%APPDATA%\Open Agent\sessions.json`.
 
+### Automatic updates from your own builds
+
+The first time you launch a release build, Open Agent installs itself to `%LOCALAPPDATA%\Open Agent\bin`, restarts from there, and remembers where it was built. That keeps `target/release` unlocked, so `cargo build --release` works while the app is open.
+
+Afterwards, whenever a new release build lands in that folder, the app shows **Update ready** in the sidebar. It saves your threads, swaps in the new build and reopens itself after 5 seconds of idle time (nothing running, empty composer). Click **Restart now** to update right away, or **Later** to wait until you click it. Debug builds never install or update; set `OPEN_AGENT_NO_UPDATE=1` to turn this off.
+
 ## Features
 
 - Threads sidebar, conversation, rounded composer, and a **Changes** panel with per-file diffs.

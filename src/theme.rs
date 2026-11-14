@@ -24,6 +24,9 @@ pub const TEXT_4: Color32 = Color32::from_rgb(0x55, 0x55, 0x55);
 pub const GREEN: Color32 = Color32::from_rgb(0x4c, 0xc2, 0x7a);
 pub const RED: Color32 = Color32::from_rgb(0xf0, 0x6a, 0x6a);
 pub const AMBER: Color32 = Color32::from_rgb(0xe8, 0xb3, 0x4f);
+/// Sidebar accent: a cool indigo → violet sweep used sparingly for focus cues.
+pub const ACCENT: Color32 = Color32::from_rgb(0x8a, 0x9b, 0xff);
+pub const ACCENT_2: Color32 = Color32::from_rgb(0xc0, 0x84, 0xfc);
 pub const DIFF_ADD_BG: Color32 = Color32::from_rgb(0x17, 0x2a, 0x1e);
 pub const DIFF_DEL_BG: Color32 = Color32::from_rgb(0x30, 0x19, 0x1a);
 

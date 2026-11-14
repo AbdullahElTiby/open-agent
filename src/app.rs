@@ -1,6 +1,7 @@
 //! The Open Agent window: thread sidebar · conversation · composer · changes panel.
 
 use crate::agent::{self, AgentEvent, RunRequest, Runs};
+use crate::attach;
 use crate::icons::{self, Icon};
 use crate::import;
 use crate::markdown;
@@ -8,6 +9,7 @@ use crate::model::*;
 use crate::model_icons::{self, ModelIcons};
 use crate::providers::{self, ProviderStatus};
 use crate::theme::{self, *};
+use crate::update;
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, CornerRadius, CursorIcon, Frame, Id, Key, Layout,
     Margin, Modifiers, Panel, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui,
@@ -20,6 +22,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const COLUMN: f32 = 760.0;
+const SEARCH_ID: &str = "sidebar-search";
+const THREAD_GROUPS: [&str; 5] = [
+    "Running",
+    "Last 24 hours",
+    "Past week",
+    "Past month",
+    "Older",
+];
 
 enum Action {
     Send(String),
@@ -35,6 +45,31 @@ enum Action {
 struct View {
     expanded: HashSet<String>,
     selected_file: Option<String>,
+    /// Sidebar thread groups the user has folded away.
+    collapsed_groups: HashSet<&'static str>,
+    /// Sidebar thread search text.
+    thread_filter: String,
+}
+
+/// Decoded image previews, keyed by attachment path (None = unreadable).
+#[derive(Default)]
+struct Thumbs(HashMap<String, Option<egui::TextureHandle>>);
+
+impl Thumbs {
+    fn get(&mut self, ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
+        self.0
+            .entry(path.to_string())
+            .or_insert_with(|| {
+                let img = attach::thumbnail(path, 480)?;
+                let size = [img.width() as usize, img.height() as usize];
+                Some(ctx.load_texture(
+                    format!("thumb:{path}"),
+                    egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()),
+                    egui::TextureOptions::LINEAR,
+                ))
+            })
+            .clone()
+    }
 }
 
 pub struct App {
@@ -49,6 +84,11 @@ pub struct App {
     procs: Runs,
     providers: Arc<Mutex<(ProviderStatus, ProviderStatus)>>,
     composer: String,
+    /// Images attached to the message being written.
+    attachments: Vec<String>,
+    thumbs: Thumbs,
+    /// Last attachment problem and when it happened (shown briefly over the composer).
+    attach_note: Option<(String, f64)>,
     view: View,
     model_icons: ModelIcons,
     logo: Option<egui::TextureHandle>,
@@ -60,7 +100,22 @@ pub struct App {
     importing: Option<Receiver<import::Report>>,
     /// Last import result and when it arrived (shown briefly in the sidebar).
     import_status: Option<(String, f64)>,
+    /// New builds announced by the self-update watcher.
+    updates: Option<Receiver<update::Update>>,
+    pending_update: Option<PendingUpdate>,
 }
+
+/// A newer build waiting to be swapped in.
+struct PendingUpdate {
+    update: update::Update,
+    /// When the countdown (re)started; it only runs while the app is idle.
+    since: f64,
+    /// False once the user chose "Later": then only the button restarts.
+    auto: bool,
+}
+
+/// Seconds of idle time before an update restarts the app on its own.
+const UPDATE_DELAY: f64 = 5.0;
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -111,6 +166,9 @@ impl App {
             procs: Runs::default(),
             providers,
             composer: String::new(),
+            attachments: vec![],
+            thumbs: Thumbs::default(),
+            attach_note: None,
             view: View::default(),
             model_icons: ModelIcons::default(),
             logo: image::load_from_memory(include_bytes!("../assets/logo-96.png"))
@@ -129,7 +187,9 @@ impl App {
             last_save: 0.0,
             ctx: cc.egui_ctx.clone(),
             importing: None,
-            import_status: None,
+            import_status: update::startup_note().map(|m| (m, 0.0)),
+            updates: update::watch(cc.egui_ctx.clone()),
+            pending_update: None,
         }
     }
 
@@ -164,9 +224,10 @@ impl App {
 
     fn send(&mut self, prompt: String) {
         let prompt = prompt.trim().to_string();
-        if prompt.is_empty() || self.running() {
+        if (prompt.is_empty() && self.attachments.is_empty()) || self.running() {
             return;
         }
+        let images = std::mem::take(&mut self.attachments);
         let (user_id, agent_id, run_id) = (self.id(), self.id(), self.id());
         let s = self.active_mut();
         let sid = s.id;
@@ -174,13 +235,27 @@ impl App {
         let relay = relay_context(s, provider);
 
         if s.messages.is_empty() {
-            s.title = prompt
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(60)
-                .collect();
+            s.title = if prompt.is_empty() {
+                "Image".into()
+            } else {
+                prompt
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(60)
+                    .collect()
+            };
+        }
+        let mut user_parts: Vec<Part> = images
+            .iter()
+            .map(|p| Part::Image { path: p.clone() })
+            .collect();
+        if !prompt.is_empty() {
+            user_parts.push(Part::Text {
+                text: prompt.clone(),
+                open: false,
+            });
         }
         s.messages.push(Message {
             id: user_id,
@@ -188,10 +263,7 @@ impl App {
             provider,
             created: now_ms(),
             status: MsgStatus::Done,
-            parts: vec![Part::Text {
-                text: prompt.clone(),
-                open: false,
-            }],
+            parts: user_parts,
             meta: Meta::default(),
         });
         let mut parts = vec![];
@@ -212,15 +284,22 @@ impl App {
         });
         s.updated = now_ms();
 
+        // Codex needs some prompt text; an image on its own still deserves an answer.
+        let text = if prompt.is_empty() {
+            "See the attached image."
+        } else {
+            &prompt
+        };
         let req = RunRequest {
             run_id,
             provider,
-            prompt: format!("{}{}", relay.unwrap_or_default(), prompt),
+            prompt: format!("{}{}", relay.unwrap_or_default(), text),
             cwd: Some(s.cwd.clone()),
             model: Some(s.model(provider).to_string()),
             effort: Some(s.effort(provider).to_string()),
             mode: s.mode,
             resume_id: s.thread(provider).cloned(),
+            images,
         };
         self.runs.insert(sid, run_id);
         self.owners.insert(run_id, (sid, agent_id));
@@ -232,6 +311,41 @@ impl App {
             let _ = self.tx.send((run_id, AgentEvent::Exit(Some(1))));
         }
         self.save_now();
+    }
+
+    fn note_attach_error(&mut self, msg: String) {
+        self.attach_note = Some((msg, self.ctx.input(|i| i.time)));
+        self.ctx.request_repaint_after(Duration::from_secs(5));
+    }
+
+    fn attach_file(&mut self, path: &std::path::Path) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !attach::is_image_path(path) {
+            self.note_attach_error(format!("{name} isn't an image (PNG, JPEG, GIF or WebP)"));
+            return;
+        }
+        match attach::from_file(path) {
+            Ok(p) => self.attachments.push(p),
+            Err(e) => self.note_attach_error(e),
+        }
+    }
+
+    /// Ctrl+V: attach a copied image, or image files copied in Explorer.
+    fn paste_image(&mut self) {
+        match attach::from_clipboard() {
+            Ok(Some(p)) => self.attachments.push(p),
+            Ok(None) => {
+                for f in attach::clipboard_files() {
+                    if attach::is_image_path(&f) {
+                        self.attach_file(&f);
+                    }
+                }
+            }
+            Err(e) => self.note_attach_error(e),
+        }
     }
 
     fn stop(&mut self) {
@@ -256,6 +370,7 @@ impl App {
         self.saved.sessions.insert(0, s);
         self.saved.active = id;
         self.composer.clear();
+        self.attachments.clear();
         self.dirty = true;
     }
 
@@ -343,6 +458,58 @@ impl App {
         });
         self.importing = Some(rx);
         self.import_status = None;
+    }
+
+    /// Nothing would be lost by restarting right now.
+    fn idle_for_update(&self) -> bool {
+        self.runs.is_empty()
+            && self.importing.is_none()
+            && self.composer.trim().is_empty()
+            && self.attachments.is_empty()
+    }
+
+    fn poll_update(&mut self) {
+        let now = self.ctx.input(|i| i.time);
+        if let Some(rx) = &self.updates {
+            while let Ok(update) = rx.try_recv() {
+                self.pending_update = Some(PendingUpdate {
+                    update,
+                    since: now,
+                    auto: true,
+                });
+            }
+        }
+        let idle = self.idle_for_update();
+        let Some(p) = &mut self.pending_update else {
+            return;
+        };
+        if !p.auto {
+            return;
+        }
+        if !idle {
+            p.since = now;
+            return;
+        }
+        if now - p.since >= UPDATE_DELAY {
+            self.restart_for_update();
+        } else {
+            self.ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
+    /// Save, swap in the new build, start it and exit this process.
+    fn restart_for_update(&mut self) {
+        let Some(p) = self.pending_update.take() else {
+            return;
+        };
+        self.save_now();
+        match update::apply(&p.update) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                self.import_status =
+                    Some((format!("Update failed: {e}"), self.ctx.input(|i| i.time)));
+            }
+        }
     }
 
     fn finish_import(&mut self) {
@@ -498,269 +665,596 @@ impl App {
 
     fn sidebar(&mut self, ui: &mut Ui) {
         let full = ui.max_rect();
-        // Title strip doubles as a drag handle.
-        let strip = Rect::from_min_size(full.min, vec2(full.width(), 44.0));
+        let time = ui.input(|i| i.time);
+
+        // ── Brand strip (doubles as a window drag handle) ──
+        let strip = Rect::from_min_size(full.min, vec2(full.width(), 52.0));
         self.window_drag(ui, strip, "drag-sidebar");
+        let cy = strip.center().y;
         let mut tx = strip.left() + 16.0;
         if let Some(logo) = &self.logo {
-            let r = Rect::from_center_size(pos2(tx + 10.0, strip.center().y), vec2(20.0, 20.0));
+            let r = Rect::from_center_size(pos2(tx + 11.0, cy), vec2(22.0, 22.0));
+            ui.painter()
+                .circle_filled(r.center(), 16.0, ACCENT.gamma_multiply(0.07));
             egui::Image::from_texture(logo)
                 .fit_to_exact_size(r.size())
                 .paint_at(ui, r);
-            tx += 28.0;
+            tx += 32.0;
         }
-        ui.painter().text(
-            pos2(tx, strip.center().y),
-            Align2::LEFT_CENTER,
-            "Open Agent",
-            theme::semibold(13.0),
-            TEXT,
+        let name = ui
+            .painter()
+            .layout_no_wrap("Open Agent".into(), theme::semibold(14.0), TEXT);
+        let name_w = name.size().x;
+        ui.painter()
+            .galley(pos2(tx, cy - name.size().y / 2.0), name, TEXT);
+        let ver = ui.painter().layout_no_wrap(
+            concat!("v", env!("CARGO_PKG_VERSION")).into(),
+            theme::body(10.5),
+            TEXT_3,
         );
-        let tog = Rect::from_center_size(
-            pos2(strip.right() - 24.0, strip.center().y),
-            vec2(28.0, 28.0),
+        let pill = Rect::from_min_size(
+            pos2(tx + name_w + 8.0, cy - 9.0),
+            vec2(ver.size().x + 12.0, 18.0),
         );
+        ui.painter().rect_filled(pill, 9.0, RAISED);
+        ui.painter()
+            .rect_stroke(pill, 9.0, Stroke::new(1.0, BORDER), StrokeKind::Inside);
+        ui.painter().galley(
+            pos2(pill.left() + 6.0, pill.center().y - ver.size().y / 2.0),
+            ver,
+            TEXT_3,
+        );
+        let tog = Rect::from_center_size(pos2(strip.right() - 24.0, cy), vec2(28.0, 28.0));
         if icon_button(ui, tog, Icon::Sidebar, "Hide sidebar (Ctrl+B)").clicked() {
             self.saved.sidebar = false;
             self.dirty = true;
         }
-        ui.add_space(46.0);
+        // Hairline that fades out from the accent colour.
+        hgradient(
+            ui.painter(),
+            Rect::from_min_max(
+                pos2(strip.left() + 14.0, strip.bottom() - 1.0),
+                pos2(strip.right() - 14.0, strip.bottom()),
+            ),
+            ACCENT.gamma_multiply(0.45),
+            Color32::TRANSPARENT,
+        );
+        ui.add_space(strip.height() + 10.0);
 
         Frame::new()
-            .inner_margin(Margin::symmetric(8, 0))
+            .inner_margin(Margin::symmetric(10, 0))
             .show(ui, |ui| {
-                let resp = list_row(ui, 34.0, false, |ui, rect, hovered| {
-                    icons::paint(
-                        ui.painter(),
-                        Rect::from_center_size(
-                            pos2(rect.left() + 18.0, rect.center().y),
-                            vec2(14.0, 14.0),
-                        ),
-                        Icon::Pencil,
-                        TEXT,
-                    );
-                    ui.painter().text(
-                        pos2(rect.left() + 36.0, rect.center().y),
-                        Align2::LEFT_CENTER,
-                        "New thread",
-                        theme::body(13.5),
-                        TEXT,
-                    );
-                    if hovered {
-                        ui.painter().text(
-                            pos2(rect.right() - 10.0, rect.center().y),
-                            Align2::RIGHT_CENTER,
-                            "Ctrl+N",
-                            theme::body(11.5),
-                            TEXT_4,
-                        );
-                    }
-                });
-                if resp.clicked() {
-                    self.actions.push(Action::NewThread);
-                }
+                self.sidebar_actions(ui, time);
+                ui.add_space(10.0);
+                self.sidebar_search(ui);
+                ui.add_space(8.0);
 
-                let busy = self.importing.is_some();
-                let time = ui.input(|i| i.time);
-                let resp = list_row(ui, 34.0, false, |ui, rect, _| {
-                    let lead = pos2(rect.left() + 18.0, rect.center().y);
-                    if busy {
-                        spinner(ui, lead, 5.0, time, TEXT_2);
-                    } else {
-                        icons::paint(
-                            ui.painter(),
-                            Rect::from_center_size(lead, vec2(14.0, 14.0)),
-                            Icon::Import,
-                            TEXT,
-                        );
-                    }
-                    let label = if busy {
-                        "Importing sessions…"
-                    } else {
-                        "Import sessions"
-                    };
-                    ui.painter().text(
-                        pos2(rect.left() + 36.0, rect.center().y),
-                        Align2::LEFT_CENTER,
-                        label,
-                        theme::body(13.5),
-                        TEXT,
-                    );
-                });
-                let resp = resp.on_hover_text(
-                    "Bring in your existing Claude Code, Claude Desktop and Codex sessions",
-                );
-                if !busy {
-                    egui::Popup::menu(&resp).show(|ui| {
-                        ui.set_min_width(230.0);
-                        ui.label(
-                            RichText::new("Import sessions from")
-                                .font(theme::body(11.5))
-                                .color(TEXT_3),
-                        );
-                        for (source, text) in [
-                            (import::Source::All, "Everything"),
-                            (import::Source::Claude, "Claude Code & Claude Desktop"),
-                            (import::Source::Codex, "Codex"),
-                        ] {
-                            if ui
-                                .selectable_label(
-                                    false,
-                                    RichText::new(text).font(theme::body(13.0)),
-                                )
-                                .clicked()
-                            {
-                                self.actions.push(Action::Import(source));
-                                ui.close();
-                            }
-                        }
-                    });
-                } else {
-                    ui.ctx().request_repaint_after(Duration::from_millis(80));
-                }
-                if let Some((msg, at)) = &self.import_status {
-                    if time - at < 10.0 {
-                        ui.label(
-                            RichText::new(format!("   {msg}"))
-                                .font(theme::body(11.5))
-                                .color(TEXT_3),
-                        );
-                        ui.ctx()
-                            .request_repaint_after(Duration::from_secs_f64(10.0 - (time - at)));
-                    }
-                }
-
-                ui.add_space(14.0);
-                ui.label(
-                    RichText::new("   Threads")
-                        .font(theme::body(12.0))
-                        .color(TEXT_3),
-                );
-                ui.add_space(2.0);
-
-                let avail = ui.available_height() - 86.0;
+                // Leave room for the agents card pinned below.
+                let avail = ui.available_height() - 128.0;
                 egui::ScrollArea::vertical()
                     .max_height(avail.max(60.0))
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let mut order: Vec<usize> = (0..self.saved.sessions.len()).collect();
-                        order.sort_by_key(|&i| std::cmp::Reverse(self.saved.sessions[i].updated));
-                        let now = now_ms();
-                        let time = ui.input(|i| i.time);
-                        for i in order {
-                            let s = &self.saved.sessions[i];
-                            let (sid, active, live) = (
-                                s.id,
-                                s.id == self.saved.active,
-                                self.runs.contains_key(&s.id),
-                            );
-                            let title = s.title.clone();
-                            let ago = ago(now.saturating_sub(s.updated));
-                            let (sprov, smodel) = (s.provider, s.model(s.provider).to_string());
-                            let model_icons = &mut self.model_icons;
-                            let mut del = false;
-                            let resp = list_row(ui, 32.0, active, |ui, rect, hovered| {
-                                let lead = pos2(rect.left() + 14.0, rect.center().y);
-                                if live {
-                                    spinner(ui, lead, 5.0, time, TEXT_2);
-                                } else {
-                                    model_icons.paint(
-                                        ui,
-                                        Rect::from_center_size(lead, vec2(14.0, 14.0)),
-                                        sprov,
-                                        &smodel,
-                                    );
-                                }
-                                let right = if hovered { 34.0 } else { 40.0 };
-                                let tr = Rect::from_min_max(
-                                    pos2(rect.left() + 28.0, rect.top()),
-                                    pos2(rect.right() - right, rect.bottom()),
-                                );
-                                let galley = ui.painter().layout_no_wrap(
-                                    title.clone(),
-                                    theme::body(13.5),
-                                    if active { TEXT } else { TEXT_2 },
-                                );
-                                let g = if galley.size().x > tr.width() {
-                                    ui.painter().layout(
-                                        title.clone(),
-                                        theme::body(13.5),
-                                        if active { TEXT } else { TEXT_2 },
-                                        f32::INFINITY,
-                                    )
-                                } else {
-                                    galley
-                                };
-                                ui.painter().with_clip_rect(tr).galley(
-                                    pos2(tr.left(), rect.center().y - g.size().y / 2.0),
-                                    g,
-                                    TEXT,
-                                );
-                                if hovered {
-                                    let dr = Rect::from_center_size(
-                                        pos2(rect.right() - 16.0, rect.center().y),
-                                        vec2(22.0, 22.0),
-                                    );
-                                    let dresp =
-                                        ui.interact(dr, Id::unique(("del", sid)), Sense::click());
-                                    if dresp.hovered() {
-                                        ui.painter().rect_filled(dr, 5.0, ACTIVE);
-                                    }
-                                    icons::paint(
-                                        ui.painter(),
-                                        dr.shrink(5.0),
-                                        Icon::Trash,
-                                        if dresp.hovered() { RED } else { TEXT_3 },
-                                    );
-                                    del = dresp.clicked();
-                                } else {
-                                    ui.painter().text(
-                                        pos2(rect.right() - 10.0, rect.center().y),
-                                        Align2::RIGHT_CENTER,
-                                        &ago,
-                                        theme::body(11.5),
-                                        TEXT_4,
-                                    );
-                                }
-                            });
-                            if del {
-                                self.actions.push(Action::Delete(sid));
-                            } else if resp.clicked() {
-                                self.actions.push(Action::Select(sid));
-                            }
-                        }
-                    });
+                    .show(ui, |ui| self.sidebar_threads(ui, time));
 
-                // Agent status, pinned to the bottom.
                 ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
                     ui.add_space(10.0);
-                    let (c, x) = self.providers.lock().unwrap().clone();
-                    for (p, st) in [(Provider::Codex, x), (Provider::Claude, c)] {
+                    self.sidebar_agents(ui, time);
+                });
+            });
+    }
+
+    /// Hero "New thread" button with an import button beside it.
+    fn sidebar_actions(&mut self, ui: &mut Ui, time: f64) {
+        let w = ui.available_width();
+        let (row, _) = ui.allocate_exact_size(vec2(w, 38.0), Sense::hover());
+        let nt = Rect::from_min_size(row.min, vec2(w - 44.0, 38.0));
+        let im = Rect::from_min_size(pos2(row.right() - 38.0, row.top()), vec2(38.0, 38.0));
+
+        let resp = ui
+            .interact(nt, Id::unique("sb-new-thread"), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand);
+        let hov = resp.hovered();
+        let p = ui.painter();
+        p.rect_filled(nt, 10.0, if hov { HOVER } else { RAISED });
+        p.rect_stroke(
+            nt,
+            10.0,
+            Stroke::new(
+                1.0,
+                if hov {
+                    ACCENT.gamma_multiply(0.55)
+                } else {
+                    BORDER_STRONG
+                },
+            ),
+            StrokeKind::Inside,
+        );
+        let disc = pos2(nt.left() + 19.0, nt.center().y);
+        p.circle_filled(
+            disc,
+            10.0,
+            ACCENT.gamma_multiply(if hov { 0.32 } else { 0.18 }),
+        );
+        icons::paint(
+            p,
+            Rect::from_center_size(disc, vec2(11.0, 11.0)),
+            Icon::Plus,
+            if hov { TEXT } else { ACCENT },
+        );
+        p.text(
+            pos2(nt.left() + 37.0, nt.center().y),
+            Align2::LEFT_CENTER,
+            "New thread",
+            theme::semibold(13.0),
+            TEXT,
+        );
+        kbd(ui, pos2(nt.right() - 10.0, nt.center().y), "Ctrl N");
+        if resp.clicked() {
+            self.actions.push(Action::NewThread);
+        }
+
+        let busy = self.importing.is_some();
+        let iresp = ui
+            .interact(im, Id::unique("sb-import"), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand);
+        let ihov = iresp.hovered();
+        ui.painter()
+            .rect_filled(im, 10.0, if ihov { HOVER } else { RAISED });
+        ui.painter().rect_stroke(
+            im,
+            10.0,
+            Stroke::new(1.0, BORDER_STRONG),
+            StrokeKind::Inside,
+        );
+        if busy {
+            spinner(ui, im.center(), 6.0, time, ACCENT);
+            ui.ctx().request_repaint_after(Duration::from_millis(80));
+        } else {
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(im.center(), vec2(15.0, 15.0)),
+                Icon::Import,
+                if ihov { TEXT } else { TEXT_2 },
+            );
+        }
+        let iresp = iresp.on_hover_text(if busy {
+            "Importing sessions…"
+        } else {
+            "Import your Claude Code, Claude Desktop and Codex sessions"
+        });
+        if !busy {
+            egui::Popup::menu(&iresp).show(|ui| {
+                ui.set_min_width(230.0);
+                ui.label(
+                    RichText::new("Import sessions from")
+                        .font(theme::body(11.5))
+                        .color(TEXT_3),
+                );
+                for (source, text) in [
+                    (import::Source::All, "Everything"),
+                    (import::Source::Claude, "Claude Code & Claude Desktop"),
+                    (import::Source::Codex, "Codex"),
+                ] {
+                    if ui
+                        .selectable_label(false, RichText::new(text).font(theme::body(13.0)))
+                        .clicked()
+                    {
+                        self.actions.push(Action::Import(source));
+                        ui.close();
+                    }
+                }
+            });
+        }
+
+        if let Some((msg, at)) = &self.import_status {
+            if time - at < 10.0 {
+                ui.add_space(8.0);
+                Frame::new()
+                    .fill(ACCENT.gamma_multiply(0.08))
+                    .stroke(Stroke::new(1.0, ACCENT.gamma_multiply(0.25)))
+                    .corner_radius(8)
+                    .inner_margin(Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new(msg.as_str())
+                                .font(theme::body(11.5))
+                                .color(TEXT_2),
+                        );
+                    });
+                ui.ctx()
+                    .request_repaint_after(Duration::from_secs_f64(10.0 - (time - at)));
+            }
+        }
+        self.update_banner(ui, time);
+    }
+
+    /// "Update ready" card with a restart countdown while idle.
+    fn update_banner(&mut self, ui: &mut Ui, time: f64) {
+        let idle = self.idle_for_update();
+        let Some(p) = &self.pending_update else {
+            return;
+        };
+        let (version, built) = (
+            p.update.version.clone(),
+            update::build_label(&p.update.build),
+        );
+        let status = if !p.auto {
+            "Restart when you're ready".to_string()
+        } else if idle {
+            let left = (UPDATE_DELAY - (time - p.since)).ceil().max(0.0);
+            format!("Restarting in {left:.0}s…")
+        } else {
+            "Will restart once you're idle".to_string()
+        };
+        let auto = p.auto;
+        let (mut now, mut later) = (false, false);
+        ui.add_space(8.0);
+        Frame::new()
+            .fill(ACCENT.gamma_multiply(0.10))
+            .stroke(Stroke::new(1.0, ACCENT.gamma_multiply(0.35)))
+            .corner_radius(10)
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Update ready")
+                            .font(theme::semibold(12.5))
+                            .color(TEXT),
+                    );
+                    ui.label(
+                        RichText::new(format!("v{version} · {built}"))
+                            .font(theme::body(11.0))
+                            .color(TEXT_3),
+                    );
+                });
+                ui.label(RichText::new(status).font(theme::body(11.5)).color(TEXT_2));
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    now = ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Restart now")
+                                    .font(theme::semibold(12.0))
+                                    .color(TEXT),
+                            )
+                            .fill(ACCENT.gamma_multiply(0.35))
+                            .corner_radius(7),
+                        )
+                        .clicked();
+                    if auto {
+                        later = ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Later").font(theme::body(12.0)).color(TEXT_2),
+                                )
+                                .corner_radius(7),
+                            )
+                            .clicked();
+                    }
+                });
+            });
+        if now {
+            self.restart_for_update();
+        } else if later {
+            if let Some(p) = &mut self.pending_update {
+                p.auto = false;
+            }
+        }
+    }
+
+    /// Search field that filters threads by title or folder (Ctrl+K).
+    fn sidebar_search(&mut self, ui: &mut Ui) {
+        let id = Id::unique(SEARCH_ID);
+        let focused = ui.memory(|m| m.has_focus(id));
+        if focused && ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.view.thread_filter.clear();
+            ui.memory_mut(|m| m.surrender_focus(id));
+        }
+        let (sr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+        ui.painter().rect_filled(sr, 8.0, CODE_BG);
+        ui.painter().rect_stroke(
+            sr,
+            8.0,
+            Stroke::new(
+                1.0,
+                if focused {
+                    ACCENT.gamma_multiply(0.55)
+                } else {
+                    BORDER
+                },
+            ),
+            StrokeKind::Inside,
+        );
+        icons::paint(
+            ui.painter(),
+            Rect::from_center_size(pos2(sr.left() + 15.0, sr.center().y), vec2(13.0, 13.0)),
+            Icon::Search,
+            if focused { TEXT_2 } else { TEXT_4 },
+        );
+        let empty = self.view.thread_filter.is_empty();
+        let edit = Rect::from_min_max(
+            pos2(sr.left() + 30.0, sr.top() + 1.0),
+            pos2(
+                sr.right() - if empty { 52.0 } else { 28.0 },
+                sr.bottom() - 1.0,
+            ),
+        );
+        ui.put(
+            edit,
+            egui::TextEdit::singleline(&mut self.view.thread_filter)
+                .id(id)
+                .hint_text(RichText::new("Search threads").color(TEXT_4))
+                .font(theme::body(13.0))
+                .text_color(TEXT)
+                .frame(Frame::new())
+                .align(Align2::LEFT_CENTER)
+                .desired_width(edit.width()),
+        );
+        if empty {
+            if !focused {
+                kbd(ui, pos2(sr.right() - 8.0, sr.center().y), "Ctrl K");
+            }
+        } else {
+            let cr =
+                Rect::from_center_size(pos2(sr.right() - 15.0, sr.center().y), vec2(20.0, 20.0));
+            let c = ui.interact(cr, Id::unique("sb-search-clear"), Sense::click());
+            if c.hovered() {
+                ui.painter().rect_filled(cr, 5.0, HOVER);
+            }
+            icons::paint(
+                ui.painter(),
+                cr.shrink(6.0),
+                Icon::Close,
+                if c.hovered() { TEXT } else { TEXT_3 },
+            );
+            if c.clicked() {
+                self.view.thread_filter.clear();
+            }
+        }
+    }
+
+    /// Threads bucketed by recency, with collapsible group headers.
+    fn sidebar_threads(&mut self, ui: &mut Ui, time: f64) {
+        let now = now_ms();
+        let query = self.view.thread_filter.trim().to_lowercase();
+        let mut order: Vec<usize> = (0..self.saved.sessions.len())
+            .filter(|&i| {
+                let s = &self.saved.sessions[i];
+                query.is_empty()
+                    || s.title.to_lowercase().contains(&query)
+                    || s.cwd.to_lowercase().contains(&query)
+            })
+            .collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(self.saved.sessions[i].updated));
+
+        if order.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                let msg = if query.is_empty() {
+                    "No threads yet".to_string()
+                } else {
+                    format!("No threads match “{}”", self.view.thread_filter.trim())
+                };
+                ui.label(RichText::new(msg).font(theme::body(12.5)).color(TEXT_3));
+            });
+            return;
+        }
+
+        const DAY: u64 = 86_400_000;
+        let mut groups: [Vec<usize>; 5] = Default::default();
+        for i in order {
+            let s = &self.saved.sessions[i];
+            let age = now.saturating_sub(s.updated);
+            let g = if self.runs.contains_key(&s.id) {
+                0
+            } else if age < DAY {
+                1
+            } else if age < 7 * DAY {
+                2
+            } else if age < 30 * DAY {
+                3
+            } else {
+                4
+            };
+            groups[g].push(i);
+        }
+
+        ui.spacing_mut().item_spacing.y = 2.0;
+        let searching = !query.is_empty();
+        let mut first = true;
+        for (g, members) in groups.iter().enumerate() {
+            if members.is_empty() {
+                continue;
+            }
+            let label = THREAD_GROUPS[g];
+            if !first {
+                ui.add_space(6.0);
+            }
+            first = false;
+            let collapsed = !searching && self.view.collapsed_groups.contains(label);
+            if group_header(ui, label, members.len(), collapsed, g == 0, time).clicked()
+                && !searching
+                && !self.view.collapsed_groups.remove(label)
+            {
+                self.view.collapsed_groups.insert(label);
+            }
+            if collapsed {
+                continue;
+            }
+            for &i in members {
+                self.thread_row(ui, i, now, time);
+            }
+        }
+    }
+
+    fn thread_row(&mut self, ui: &mut Ui, i: usize, now: u64, time: f64) {
+        let s = &self.saved.sessions[i];
+        let (sid, active, live) = (
+            s.id,
+            s.id == self.saved.active,
+            self.runs.contains_key(&s.id),
+        );
+        let title = s.title.clone();
+        let folder = folder_name(&s.cwd);
+        let (sprov, smodel) = (s.provider, s.model(s.provider).to_string());
+        let subtitle = match (folder.is_empty(), smodel == "default") {
+            (true, _) => pretty_model(&smodel),
+            (false, true) => folder.clone(),
+            (false, false) => format!("{folder} · {}", pretty_model(&smodel)),
+        };
+        let ago = ago(now.saturating_sub(s.updated));
+        let model_icons = &mut self.model_icons;
+        let mut del = false;
+        let resp = list_row(ui, 46.0, active, |ui, rect, hovered| {
+            if active {
+                let bar = Rect::from_min_size(
+                    pos2(rect.left() + 1.0, rect.top() + 11.0),
+                    vec2(3.0, rect.height() - 22.0),
+                );
+                vgradient(ui.painter(), bar, ACCENT, ACCENT_2);
+            }
+            let tile =
+                Rect::from_center_size(pos2(rect.left() + 23.0, rect.center().y), vec2(26.0, 26.0));
+            ui.painter().rect_filled(
+                tile,
+                7.0,
+                if live {
+                    ACCENT.gamma_multiply(0.14)
+                } else {
+                    Color32::from_white_alpha(8)
+                },
+            );
+            if live {
+                spinner(ui, tile.center(), 5.5, time, ACCENT);
+            } else {
+                model_icons.paint(
+                    ui,
+                    Rect::from_center_size(tile.center(), vec2(14.0, 14.0)),
+                    sprov,
+                    &smodel,
+                );
+            }
+
+            let x = rect.left() + 44.0;
+            let right = if hovered { 34.0 } else { 40.0 };
+            let max_w = (rect.right() - right - x).max(10.0);
+            let tcol = if active { TEXT } else { TEXT_2 };
+            let tg = one_line(ui, &title, theme::body(13.5), tcol, max_w);
+            ui.painter()
+                .galley(pos2(x, rect.center().y - 1.0 - tg.size().y), tg, tcol);
+            let sg = one_line(ui, &subtitle, theme::body(11.5), TEXT_4, max_w);
+            ui.painter()
+                .galley(pos2(x, rect.center().y + 1.0), sg, TEXT_4);
+
+            if hovered {
+                let dr = Rect::from_center_size(
+                    pos2(rect.right() - 16.0, rect.center().y),
+                    vec2(22.0, 22.0),
+                );
+                let dresp = ui.interact(dr, Id::unique(("del", sid)), Sense::click());
+                if dresp.hovered() {
+                    ui.painter().rect_filled(dr, 5.0, ACTIVE);
+                }
+                icons::paint(
+                    ui.painter(),
+                    dr.shrink(5.0),
+                    Icon::Trash,
+                    if dresp.hovered() { RED } else { TEXT_3 },
+                );
+                del = dresp.clicked();
+            } else {
+                ui.painter().text(
+                    pos2(rect.right() - 10.0, rect.center().y - 8.0),
+                    Align2::RIGHT_CENTER,
+                    &ago,
+                    theme::body(11.0),
+                    TEXT_4,
+                );
+            }
+        });
+        if del {
+            self.actions.push(Action::Delete(sid));
+        } else if resp.clicked() {
+            self.actions.push(Action::Select(sid));
+        }
+    }
+
+    /// Card listing each agent CLI and whether it's ready.
+    fn sidebar_agents(&mut self, ui: &mut Ui, time: f64) {
+        let (c, x) = self.providers.lock().unwrap().clone();
+        let ready = [&c, &x].iter().filter(|s| s.installed).count();
+        let checking = !c.checked || !x.checked;
+        if checking {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
+        Frame::new()
+            .fill(PANEL)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(10)
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    let (hr, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+                    let hg = caps(ui, "Agents", TEXT_3);
+                    ui.painter().galley(
+                        pos2(hr.left(), hr.center().y - hg.size().y / 2.0),
+                        hg,
+                        TEXT_3,
+                    );
+                    ui.painter().text(
+                        pos2(hr.right(), hr.center().y),
+                        Align2::RIGHT_CENTER,
+                        if checking {
+                            "checking…".to_string()
+                        } else {
+                            format!("{ready}/2 ready")
+                        },
+                        theme::body(10.5),
+                        if !checking && ready == 2 {
+                            GREEN
+                        } else {
+                            TEXT_4
+                        },
+                    );
+                    ui.add_space(2.0);
+                    for (p, st) in [(Provider::Claude, &c), (Provider::Codex, &x)] {
                         let (rect, _) = ui
                             .allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
                         let ok = st.installed;
                         let ir = Rect::from_center_size(
-                            pos2(rect.left() + 14.0, rect.center().y),
+                            pos2(rect.left() + 8.0, rect.center().y),
                             vec2(14.0, 14.0),
                         );
-                        if st.checked && !ok {
-                            ui.painter().circle_filled(ir.center(), 3.0, RED);
+                        self.model_icons.paint(ui, ir, p, "default");
+                        // Status dot tucked into the icon's corner.
+                        let dot = ir.right_bottom() + vec2(1.0, 1.0);
+                        let col = if !st.checked {
+                            let t = ((time * 4.0).sin() * 0.5 + 0.5) as f32;
+                            lerp(TEXT_4, AMBER, t)
+                        } else if ok {
+                            GREEN
                         } else {
-                            self.model_icons.paint(ui, ir, p, "default");
-                        }
+                            RED
+                        };
+                        ui.painter().circle_filled(dot, 4.0, PANEL);
+                        ui.painter().circle_filled(dot, 2.6, col);
                         let name = match p {
                             Provider::Claude => "Claude Code",
                             Provider::Codex => "Codex",
                         };
                         ui.painter().text(
-                            pos2(rect.left() + 26.0, rect.center().y),
+                            pos2(rect.left() + 24.0, rect.center().y),
                             Align2::LEFT_CENTER,
                             name,
                             theme::body(12.5),
-                            TEXT_2,
+                            if ok { TEXT_2 } else { TEXT_3 },
                         );
                         let detail = if !st.checked {
-                            "checking…".to_string()
+                            String::new()
                         } else if !ok {
                             "not installed".into()
                         } else if p == Provider::Codex
@@ -774,17 +1268,13 @@ impl App {
                                 .unwrap_or_default()
                         };
                         ui.painter().text(
-                            pos2(rect.right() - 10.0, rect.center().y),
+                            pos2(rect.right(), rect.center().y),
                             Align2::RIGHT_CENTER,
                             detail,
-                            theme::body(11.5),
-                            TEXT_4,
+                            theme::mono(10.5),
+                            if ok { TEXT_4 } else { RED },
                         );
                     }
-                    ui.add_space(4.0);
-                    let r = ui.available_rect_before_wrap();
-                    ui.painter()
-                        .hline(r.x_range(), r.bottom(), Stroke::new(1.0, BORDER));
                 });
             });
     }
@@ -874,6 +1364,7 @@ impl App {
         let session = &self.saved.sessions[idx];
         let view = &mut self.view;
         let model_icons = &mut self.model_icons;
+        let thumbs = &mut self.thumbs;
         egui::ScrollArea::vertical()
             .id_salt(("conv", session.id))
             .stick_to_bottom(true)
@@ -884,7 +1375,7 @@ impl App {
                     let mut prev_provider: Option<Provider> = None;
                     for m in &session.messages {
                         match m.role {
-                            Role::User => user_bubble(ui, m),
+                            Role::User => user_bubble(ui, m, thumbs),
                             Role::Agent => {
                                 let show_name = prev_provider != Some(m.provider);
                                 prev_provider = Some(m.provider);
@@ -1002,6 +1493,19 @@ impl App {
 
         centered_column(ui, |ui| {
             ui.add_space(4.0);
+            // Ctrl+V with an image on the clipboard attaches it. egui only pastes
+            // text, so watch the raw key and read the clipboard ourselves.
+            let paste = ui.input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(e, egui::Event::Key { key: Key::V, pressed: true, modifiers, .. }
+                        if modifiers.command)
+                })
+            });
+            let paste_target = ui.memory(|m| m.focused().is_none() || m.has_focus(edit_id));
+            if paste && paste_target {
+                self.paste_image();
+            }
+
             // Enter sends, Shift+Enter is a newline.
             let focused = ui.memory(|m| m.has_focus(edit_id));
             if focused && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) && !running {
@@ -1045,6 +1549,7 @@ impl App {
                     } else {
                         format!("Ask {} to build, fix or explain anything", provider.label())
                     };
+                    self.attachment_strip(ui);
                     egui::ScrollArea::vertical()
                         .max_height(220.0)
                         .id_salt("composer-scroll")
@@ -1069,7 +1574,8 @@ impl App {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let (rect, resp) =
                                 ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
-                            let can_send = !self.composer.trim().is_empty();
+                            let can_send =
+                                !self.composer.trim().is_empty() || !self.attachments.is_empty();
                             let (bg, fg, icon) = if running {
                                 (TEXT, Color32::BLACK, Icon::Stop)
                             } else if can_send {
@@ -1141,6 +1647,56 @@ impl App {
             });
             ui.add_space(8.0);
         });
+    }
+
+    /// Thumbnails of pending attachments (click to remove) plus any attach error.
+    fn attachment_strip(&mut self, ui: &mut Ui) {
+        let now = ui.input(|i| i.time);
+        if self
+            .attach_note
+            .as_ref()
+            .is_some_and(|(_, at)| now - at >= 5.0)
+        {
+            self.attach_note = None;
+        }
+        if let Some((msg, _)) = &self.attach_note {
+            ui.label(RichText::new(msg).font(theme::body(12.0)).color(RED));
+            ui.add_space(6.0);
+        }
+        if self.attachments.is_empty() {
+            return;
+        }
+        let mut remove = None;
+        let ctx = ui.ctx().clone();
+        ui.horizontal_wrapped(|ui| {
+            for (i, path) in self.attachments.iter().enumerate() {
+                let tex = self.thumbs.get(&ctx, path);
+                let (rect, resp) =
+                    ui.allocate_exact_size(tile_size(tex.as_ref(), 56.0, 120.0), Sense::click());
+                paint_tile(ui, rect, tex.as_ref());
+                if resp.hovered() {
+                    ui.painter()
+                        .rect_filled(rect, 8.0, Color32::from_black_alpha(110));
+                    icons::paint(
+                        ui.painter(),
+                        Rect::from_center_size(rect.center(), vec2(12.0, 12.0)),
+                        Icon::Close,
+                        TEXT,
+                    );
+                }
+                if resp
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text("Remove")
+                    .clicked()
+                {
+                    remove = Some(i);
+                }
+            }
+        });
+        if let Some(i) = remove {
+            self.attachments.remove(i);
+        }
+        ui.add_space(8.0);
     }
 
     fn model_menu(
@@ -1422,15 +1978,24 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let (n, b, dot, j, esc) = ctx.input_mut(|i| {
+        let (n, b, dot, j, k, esc) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::COMMAND, Key::N),
                 i.consume_key(Modifiers::COMMAND, Key::B),
                 i.consume_key(Modifiers::COMMAND, Key::Period),
                 i.consume_key(Modifiers::COMMAND, Key::J),
+                i.consume_key(Modifiers::COMMAND, Key::K),
                 i.key_pressed(Key::Escape),
             )
         });
+        let searching = ctx.memory(|m| m.has_focus(Id::unique(SEARCH_ID)));
+        if k {
+            if !self.saved.sidebar {
+                self.saved.sidebar = true;
+                self.dirty = true;
+            }
+            ctx.memory_mut(|m| m.request_focus(Id::unique(SEARCH_ID)));
+        }
         if n {
             self.actions.push(Action::NewThread);
         }
@@ -1446,7 +2011,8 @@ impl App {
             let s = self.active_mut();
             s.provider = s.provider.other();
         }
-        if esc && self.running() {
+        // Escape in the thread search clears it rather than stopping the run.
+        if esc && self.running() && !searching {
             self.actions.push(Action::Stop);
         }
     }
@@ -1457,6 +2023,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.drain_events();
         self.finish_import();
+        self.poll_update();
         self.model_icons.pump(&ctx);
         self.shortcuts(&ctx);
         let (mut sidebar_open, mut changes_open) = (self.saved.sidebar, self.saved.changes);
@@ -1494,6 +2061,34 @@ impl eframe::App for App {
 
         self.resize_edges(ui);
 
+        // Drag and drop image files anywhere on the window to attach them.
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect()
+        });
+        for p in dropped {
+            self.attach_file(&p);
+        }
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                Id::new("drop-overlay"),
+            ));
+            let r = ui.max_rect();
+            painter.rect_filled(r, 0.0, Color32::from_black_alpha(150));
+            painter.text(
+                r.center(),
+                Align2::CENTER_CENTER,
+                "Drop images to attach",
+                theme::semibold(18.0),
+                TEXT,
+            );
+        }
+
         for a in std::mem::take(&mut self.actions) {
             match a {
                 Action::Send(t) => self.send(t),
@@ -1530,7 +2125,76 @@ use crate::model;
 
 // ───────────────────────────── message rendering ─────────────────────────────
 
-fn user_bubble(ui: &mut Ui, m: &Message) {
+/// Size for an image tile of the given height, keeping its aspect ratio within `max_w`.
+fn tile_size(tex: Option<&egui::TextureHandle>, h: f32, max_w: f32) -> egui::Vec2 {
+    let aspect = tex
+        .map(|t| t.size_vec2())
+        .filter(|s| s.y > 0.0)
+        .map(|s| s.x / s.y)
+        .unwrap_or(1.0);
+    let w = (h * aspect).clamp(h * 0.6, max_w);
+    vec2(w, (w / aspect).min(h))
+}
+
+fn paint_tile(ui: &Ui, rect: Rect, tex: Option<&egui::TextureHandle>) {
+    match tex {
+        Some(t) => egui::Image::from_texture(t)
+            .corner_radius(CornerRadius::same(8))
+            .fit_to_exact_size(rect.size())
+            .paint_at(ui, rect),
+        None => {
+            ui.painter().rect_filled(rect, 8.0, ACTIVE);
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "missing",
+                theme::body(11.0),
+                TEXT_4,
+            );
+        }
+    }
+}
+
+/// Open an attachment in the system image viewer.
+fn open_external(path: &str) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+fn user_bubble(ui: &mut Ui, m: &Message, thumbs: &mut Thumbs) {
+    let images: Vec<&str> = m
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            Part::Image { path } => Some(path.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !images.is_empty() {
+        let ctx = ui.ctx().clone();
+        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            // right_to_left: draw in reverse so they read in attach order.
+            for path in images.iter().rev() {
+                let tex = thumbs.get(&ctx, path);
+                let (rect, resp) =
+                    ui.allocate_exact_size(tile_size(tex.as_ref(), 160.0, 280.0), Sense::click());
+                paint_tile(ui, rect, tex.as_ref());
+                if tex.is_some()
+                    && resp
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text("Open image")
+                        .clicked()
+                {
+                    open_external(path);
+                }
+            }
+        });
+    }
     let text: String = m
         .parts
         .iter()
@@ -1542,6 +2206,12 @@ fn user_bubble(ui: &mut Ui, m: &Message) {
             }
         })
         .collect();
+    if text.is_empty() {
+        return;
+    }
+    if !images.is_empty() {
+        ui.add_space(6.0);
+    }
     let w = ui.available_width();
     let max_w = (w * 0.78).min(560.0);
     let galley = ui
@@ -2302,6 +2972,119 @@ fn list_row(
     }
     paint(ui, rect, hovered);
     resp
+}
+
+/// Collapsible sidebar group header: chevron · SMALL CAPS label · count pill.
+fn group_header(
+    ui: &mut Ui,
+    label: &str,
+    count: usize,
+    collapsed: bool,
+    live: bool,
+    time: f64,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+    let hov = resp.hovered();
+    let col = if hov { TEXT_2 } else { TEXT_3 };
+    icons::paint(
+        ui.painter(),
+        Rect::from_center_size(pos2(rect.left() + 9.0, rect.center().y), vec2(9.0, 9.0)),
+        if collapsed {
+            Icon::ChevronRight
+        } else {
+            Icon::ChevronDown
+        },
+        if hov { TEXT_2 } else { TEXT_4 },
+    );
+    let mut x = rect.left() + 20.0;
+    if live {
+        let t = ((time * 3.0).sin() * 0.5 + 0.5) as f32;
+        let c = pos2(x + 3.0, rect.center().y);
+        ui.painter()
+            .circle_filled(c, 3.0 + 2.5 * t, ACCENT.gamma_multiply(0.25 * (1.0 - t)));
+        ui.painter().circle_filled(c, 3.0, ACCENT);
+        x += 12.0;
+        ui.ctx().request_repaint_after(Duration::from_millis(50));
+    }
+    let g = caps(ui, label, col);
+    let gw = g.size().x;
+    ui.painter()
+        .galley(pos2(x, rect.center().y - g.size().y / 2.0), g, col);
+    let n = ui
+        .painter()
+        .layout_no_wrap(count.to_string(), theme::body(10.5), TEXT_3);
+    let pill = Rect::from_min_size(
+        pos2(x + gw + 7.0, rect.center().y - 8.0),
+        vec2((n.size().x + 10.0).max(18.0), 16.0),
+    );
+    ui.painter()
+        .rect_filled(pill, 8.0, Color32::from_white_alpha(10));
+    ui.painter()
+        .galley(pill.center() - n.size() / 2.0, n, TEXT_3);
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// Uppercase, letter-spaced label used for sidebar section titles.
+fn caps(ui: &Ui, text: &str, color: Color32) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &text.to_uppercase(),
+        0.0,
+        egui::TextFormat {
+            font_id: theme::semibold(10.5),
+            color,
+            extra_letter_spacing: 0.8,
+            ..Default::default()
+        },
+    );
+    ui.painter().layout_job(job)
+}
+
+/// Single line of text truncated with an ellipsis to `max_w`.
+fn one_line(
+    ui: &Ui,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    max_w: f32,
+) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_w);
+    ui.painter().layout_job(job)
+}
+
+/// Keyboard hint chip, right-aligned at `right_center`.
+fn kbd(ui: &Ui, right_center: egui::Pos2, keys: &str) {
+    let g = ui
+        .painter()
+        .layout_no_wrap(keys.to_owned(), theme::body(10.5), TEXT_4);
+    let r = Rect::from_min_max(
+        pos2(right_center.x - g.size().x - 10.0, right_center.y - 9.0),
+        pos2(right_center.x, right_center.y + 9.0),
+    );
+    ui.painter()
+        .rect_stroke(r, 5.0, Stroke::new(1.0, BORDER_STRONG), StrokeKind::Inside);
+    ui.painter().galley(r.center() - g.size() / 2.0, g, TEXT_4);
+}
+
+fn hgradient(p: &egui::Painter, r: Rect, left: Color32, right: Color32) {
+    gradient(p, r, [left, right, right, left]);
+}
+
+fn vgradient(p: &egui::Painter, r: Rect, top: Color32, bottom: Color32) {
+    gradient(p, r, [top, top, bottom, bottom]);
+}
+
+/// Fill `r` with per-corner colours (left-top, right-top, right-bottom, left-bottom).
+fn gradient(p: &egui::Painter, r: Rect, c: [Color32; 4]) {
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(r.left_top(), c[0]);
+    mesh.colored_vertex(r.right_top(), c[1]);
+    mesh.colored_vertex(r.right_bottom(), c[2]);
+    mesh.colored_vertex(r.left_bottom(), c[3]);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    p.add(mesh);
 }
 
 fn icon_button(ui: &mut Ui, rect: Rect, icon: Icon, tip: &str) -> Response {

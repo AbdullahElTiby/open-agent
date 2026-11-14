@@ -3,6 +3,7 @@
 
 mod agent;
 mod app;
+mod attach;
 mod icons;
 mod import;
 mod markdown;
@@ -11,11 +12,16 @@ mod model_icons;
 mod providers;
 mod resolve;
 mod theme;
+mod update;
 
 use eframe::egui;
 use std::sync::Arc;
 
 fn main() -> eframe::Result {
+    // A build run from its build folder installs itself and relaunches from there.
+    if update::bootstrap() {
+        return Ok(());
+    }
     let icon = image::load_from_memory(include_bytes!("../assets/icon.png"))
         .ok()
         .map(|img| {

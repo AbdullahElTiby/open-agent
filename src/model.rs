@@ -128,6 +128,10 @@ pub enum Part {
         text: String,
         tone: Tone,
     },
+    /// An image the user attached; `path` points into the attachments folder.
+    Image {
+        path: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -288,6 +292,7 @@ pub fn relay_context(s: &Session, to: Provider) -> Option<String> {
             .iter()
             .filter_map(|p| match p {
                 Part::Text { text, .. } => Some(text.clone()),
+                Part::Image { .. } => Some("[image]".into()),
                 Part::Tool { name, input, .. } if name != "__hidden" => {
                     let t = tool_target(input);
                     Some(if t.is_empty() {
@@ -606,7 +611,7 @@ fn yes() -> bool {
     true
 }
 
-fn data_dir() -> PathBuf {
+pub fn data_dir() -> PathBuf {
     let base = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_DATA_HOME"))
         .map(PathBuf::from)

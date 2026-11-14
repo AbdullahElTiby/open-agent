@@ -65,6 +65,33 @@ pub struct RunRequest {
     pub effort: Option<String>,
     pub mode: Mode,
     pub resume_id: Option<String>,
+    /// Attached image files (already normalized by `attach`).
+    pub images: Vec<String>,
+}
+
+/// Claude's stream-json input: one user message with the text and base64 images.
+fn claude_input(prompt: &str, images: &[String]) -> Result<String, String> {
+    let mut content = vec![];
+    for path in images {
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("Can't read attachment {path}: {e}"))?;
+        content.push(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": crate::attach::media_type(path),
+                "data": crate::attach::base64(&bytes),
+            }
+        }));
+    }
+    if !prompt.is_empty() {
+        content.push(serde_json::json!({ "type": "text", "text": prompt }));
+    }
+    let msg = serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": content },
+    });
+    Ok(format!("{msg}\n"))
 }
 
 /// Events flowing back to the UI thread, tagged with their run id.
@@ -107,6 +134,7 @@ pub fn start(
         .clone()
         .filter(|e| !e.is_empty() && e != "default");
     let resume = req.resume_id.clone().filter(|r| !r.is_empty());
+    let mut stdin_data = req.prompt.clone();
 
     match req.provider {
         Provider::Claude => {
@@ -132,6 +160,11 @@ pub fn start(
             if let Some(r) = &resume {
                 cmd.args(["--resume", r]);
             }
+            // Plain-text stdin can't carry images; switch to the SDK's message format.
+            if !req.images.is_empty() {
+                cmd.args(["--input-format", "stream-json"]);
+                stdin_data = claude_input(&req.prompt, &req.images)?;
+            }
         }
         Provider::Codex => {
             cmd.args(["exec", "--json", "--skip-git-repo-check"]);
@@ -150,6 +183,11 @@ pub fn start(
             if let Some(e) = &effort {
                 cmd.args(["-c", &format!("model_reasoning_effort=\"{e}\"")]);
             }
+            // `--image=` (not `-i x`): the flag takes many values and would swallow
+            // the `resume` subcommand or the trailing `-`.
+            for img in &req.images {
+                cmd.arg(format!("--image={img}"));
+            }
             if let Some(r) = &resume {
                 cmd.args(["resume", r]);
             }
@@ -166,9 +204,8 @@ pub fn start(
 
     // Prompt goes through stdin: no shell quoting issues, no length limits.
     if let Some(mut stdin) = child.stdin.take() {
-        let prompt = req.prompt.clone();
         thread::spawn(move || {
-            let _ = stdin.write_all(prompt.as_bytes());
+            let _ = stdin.write_all(stdin_data.as_bytes());
         });
     }
 
